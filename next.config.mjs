@@ -1,4 +1,4 @@
-const basePath = process.env.PAGES_BASE_PATH || '';
+const basePath = '/hands-on';
 
 /** @type {import('next').NextConfig} */
 const nextConfig = {

@@ -1,0 +1,216 @@
+/* ============================================================
+   FX 기믹 — 캔버스 레이어 + 컨트롤 패널 스타일
+   ============================================================ */
+
+/* 캔버스 레이어 (뷰포트 고정, 클릭 통과) */
+.fx-canvas {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+.fx-canvas--pcb {
+  z-index: 0;
+}
+.fx-canvas--particles {
+  z-index: 5;
+}
+
+/* 클릭 가능한 프로필 */
+.avatar--click {
+  cursor: pointer;
+}
+.avatar--click .avatar__inner {
+  transition: transform 0.15s ease;
+}
+.avatar--click:active .avatar__inner {
+  transform: scale(0.96);
+}
+
+/* ---------- FAB ---------- */
+.fx-fab {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  z-index: 30;
+  width: 46px;
+  height: 46px;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  background: var(--card);
+  color: var(--accent-text);
+  box-shadow: var(--shadow);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: transform 0.18s ease, border-color 0.18s ease;
+}
+.fx-fab:hover {
+  transform: translateY(-2px);
+  border-color: var(--cyan);
+}
+.fx-fab:focus-visible {
+  outline: 2px solid var(--cyan);
+  outline-offset: 3px;
+}
+.fx-fab svg {
+  animation: spin-slow 24s linear infinite;
+}
+
+/* ---------- 패널 ---------- */
+.fx-panel {
+  position: fixed;
+  right: 16px;
+  bottom: 72px;
+  z-index: 30;
+  width: 252px;
+  max-width: calc(100vw - 32px);
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  box-shadow: var(--shadow);
+  padding: 14px 14px 12px;
+  color: var(--ink);
+  font-family: 'Noto Sans KR', system-ui, sans-serif;
+}
+.fx-panel__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+.fx-panel__title {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  color: var(--ink-soft);
+  white-space: nowrap;
+}
+.fx-panel__close {
+  background: none;
+  border: none;
+  color: var(--ink-soft);
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  padding: 4px;
+}
+.fx-panel__close:hover {
+  color: var(--ink);
+}
+
+.fx-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 9px 0;
+  border-top: 1px solid var(--border);
+}
+.fx-row__label {
+  font-family: 'Sora', 'Noto Sans KR', sans-serif;
+  font-weight: 600;
+  font-size: 13px;
+}
+.fx-row__sub {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 9.5px;
+  letter-spacing: 0.02em;
+  color: var(--ink-soft);
+  margin-top: 2px;
+}
+
+/* ---------- 스위치 ---------- */
+.fxsw {
+  position: relative;
+  flex: 0 0 auto;
+  width: 42px;
+  height: 24px;
+  border-radius: 999px;
+  background: var(--card-2);
+  border: 1px solid var(--border);
+  cursor: pointer;
+  padding: 0;
+  transition: background 0.25s, border-color 0.25s;
+}
+.fxsw__knob {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--ink-soft);
+  transition: transform 0.25s cubic-bezier(0.4, 1.25, 0.5, 1), background 0.25s;
+}
+.fxsw.is-on {
+  background: color-mix(in srgb, var(--cyan) 24%, transparent);
+  border-color: var(--cyan);
+}
+.fxsw.is-on .fxsw__knob {
+  transform: translateX(18px);
+  background: var(--cyan);
+  box-shadow: 0 0 8px var(--glow);
+}
+.fxsw:focus-visible {
+  outline: 2px solid var(--cyan);
+  outline-offset: 3px;
+}
+
+/* ---------- multiplicity 슬라이더 ---------- */
+.fx-mult {
+  padding: 4px 0 8px;
+}
+.fx-mult__top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  color: var(--ink-soft);
+  margin-bottom: 7px;
+}
+.fx-mult__val {
+  color: var(--accent-text);
+  font-weight: 600;
+}
+.fx-range {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 4px;
+  border-radius: 999px;
+  background: var(--border);
+  outline: none;
+}
+.fx-range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--cyan);
+  box-shadow: 0 0 8px var(--glow);
+  cursor: pointer;
+  border: 2px solid var(--card);
+}
+.fx-range::-moz-range-thumb {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--cyan);
+  cursor: pointer;
+  border: 2px solid var(--card);
+}
+
+.fx-hint {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 9px;
+  letter-spacing: 0.04em;
+  color: var(--ink-soft);
+  opacity: 0.7;
+  margin-top: 8px;
+  text-align: center;
+}

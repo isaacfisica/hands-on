@@ -1,0 +1,1070 @@
+/* ============================================================
+   이삭 ISAAC — 링크 허브  ·  "실험실 작업대" 무드
+   모든 색/간격 토큰은 :root(라이트=기본) / [data-theme="dark"]
+   한 곳에서 관리합니다.
+   ============================================================ */
+
+* {
+  box-sizing: border-box;
+}
+html,
+body {
+  margin: 0;
+  padding: 0;
+}
+body {
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  font-family: 'Noto Sans KR', system-ui, sans-serif;
+  background-color: var(--paper);
+  color: var(--ink);
+  transition: background-color 0.45s ease, color 0.45s ease;
+}
+
+/* ---------- 디자인 토큰: 라이트(기본) = 연구실 벤치 / 실험노트 ---------- */
+:root {
+  --paper: #faf8f3;
+  --paper-2: #f2ede3;
+  --card: #ffffff;
+  --card-2: #fbf8f2;
+  --grid: rgba(28, 34, 48, 0.055);
+  --grid-strong: rgba(28, 34, 48, 0.11);
+  --ink: #1b2230;
+  --ink-soft: #646c7e;
+  --ink-faint: #9aa1b0;
+  --border: rgba(28, 34, 48, 0.12);
+  --tile: #101826;
+  --tile-ink: #eaf6fa;
+  --cyan: #16b6d2;
+  --accent-text: #0c8499;
+  --glow: rgba(34, 211, 238, 0.2);
+  --copper: #af724a;
+  --mustard: #d49a26;
+  --shadow: 0 1px 2px rgba(28, 34, 48, 0.05), 0 10px 26px rgba(28, 34, 48, 0.055);
+}
+
+/* ---------- 다크 = 지하 검출기 홀 / 원자로 수조 야간 ---------- */
+[data-theme='dark'] {
+  --paper: #080e18;
+  --paper-2: #0c1420;
+  --card: #0f1a2a;
+  --card-2: #0c1626;
+  --grid: rgba(120, 175, 215, 0.055);
+  --grid-strong: rgba(120, 175, 215, 0.11);
+  --ink: #e9f2f9;
+  --ink-soft: #8d9bb1;
+  --ink-faint: #5c6b82;
+  --border: rgba(130, 175, 215, 0.16);
+  --tile: #0a1422;
+  --tile-ink: #bcefff;
+  --cyan: #2de2ff;
+  --accent-text: #62ecff;
+  --glow: rgba(45, 226, 255, 0.32);
+  --copper: #d49a6b;
+  --mustard: #e7b33e;
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.45), 0 14px 38px rgba(0, 0, 0, 0.5);
+}
+
+/* ============================================================
+   상단 내비게이션 바 (Navbar.tsx)
+   토큰이 :root에 있으므로 CSS 변수를 직접 사용합니다.
+   ============================================================ */
+.nav {
+  position: sticky;
+  top: 0;
+  z-index: 50;
+  background: color-mix(in srgb, var(--paper) 82%, transparent);
+  backdrop-filter: saturate(1.4) blur(12px);
+  -webkit-backdrop-filter: saturate(1.4) blur(12px);
+  border-bottom: 1px solid var(--border);
+  font-family: 'Noto Sans KR', system-ui, sans-serif;
+  transition: background 0.45s ease, border-color 0.45s ease;
+}
+.nav__inner {
+  max-width: 980px;
+  margin: 0 auto;
+  height: 60px;
+  padding: 0 20px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+/* 브랜드 */
+.nav__brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 11px;
+  text-decoration: none;
+  color: var(--ink);
+}
+.nav__mark {
+  width: 34px;
+  height: 34px;
+  flex: 0 0 auto;
+  border-radius: 10px;
+  background: var(--tile);
+  color: var(--tile-ink);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: var(--shadow);
+}
+.nav__mark svg {
+  width: 20px;
+  height: 20px;
+}
+.nav__word {
+  font-family: 'Sora', 'Noto Sans KR', sans-serif;
+  font-weight: 700;
+  font-size: 17px;
+  letter-spacing: -0.01em;
+}
+.nav__word em {
+  font-style: normal;
+  font-weight: 600;
+  color: var(--accent-text);
+}
+
+/* 데스크탑 메뉴 */
+.nav__menu {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+}
+.nav__link {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 12px;
+  letter-spacing: 0.06em;
+  color: var(--ink-soft);
+  text-decoration: none;
+  padding: 8px 12px;
+  border-radius: 9px;
+  transition: color 0.18s ease, background 0.18s ease;
+}
+.nav__link:hover {
+  color: var(--ink);
+  background: color-mix(in srgb, var(--ink) 5%, transparent);
+}
+.nav__cta {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 12px;
+  letter-spacing: 0.06em;
+  color: var(--accent-text);
+  text-decoration: none;
+  padding: 8px 16px;
+  margin-left: 6px;
+  border: 1px solid rgba(22, 182, 210, 0.55);
+  border-radius: 999px;
+  transition: background 0.18s ease, color 0.18s ease, box-shadow 0.18s ease;
+}
+.nav__cta:hover {
+  color: #fff;
+  background: var(--cyan);
+  box-shadow: 0 0 0 1px var(--cyan), 0 8px 20px var(--glow);
+}
+
+/* 햄버거 버튼 */
+.nav__burger {
+  display: none;
+  width: 42px;
+  height: 42px;
+  flex: 0 0 auto;
+  border: 1px solid var(--border);
+  border-radius: 11px;
+  background: var(--card);
+  cursor: pointer;
+  padding: 0;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  flex-direction: column;
+  box-shadow: var(--shadow);
+}
+.nav__burger span {
+  display: block;
+  width: 18px;
+  height: 2px;
+  border-radius: 2px;
+  background: var(--ink);
+  transition: transform 0.25s ease, opacity 0.2s ease;
+}
+.nav__burger.is-open span:nth-child(1) {
+  transform: translateY(7px) rotate(45deg);
+}
+.nav__burger.is-open span:nth-child(2) {
+  opacity: 0;
+}
+.nav__burger.is-open span:nth-child(3) {
+  transform: translateY(-7px) rotate(-45deg);
+}
+.nav__burger:focus-visible {
+  outline: 2px solid var(--cyan);
+  outline-offset: 2px;
+}
+
+/* 모바일 드롭다운 */
+.nav__mobile {
+  display: none;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 16px 16px;
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--paper) 96%, transparent);
+  transition: background 0.45s ease, border-color 0.45s ease;
+}
+.nav__mobile.is-open {
+  display: flex;
+  animation: nav-drop 0.22s ease;
+}
+@keyframes nav-drop {
+  from {
+    opacity: 0;
+    transform: translateY(-6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.nav__mlink {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 13px;
+  letter-spacing: 0.04em;
+  color: var(--ink);
+  text-decoration: none;
+  padding: 12px 12px;
+  border-radius: 10px;
+  transition: background 0.18s ease;
+}
+.nav__mlink:hover {
+  background: color-mix(in srgb, var(--ink) 5%, transparent);
+}
+.nav__cta--block {
+  margin: 6px 0 0;
+  text-align: center;
+  padding: 12px;
+}
+
+/* 네비게이션 바 내 모바일 전용 테마 토글 */
+.nav__toggle-mobile {
+  display: none;
+}
+
+/* 모바일 드롭다운 토글 버튼 */
+.nav__mlink--toggle {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: none;
+  border: none;
+  cursor: pointer;
+  text-align: left;
+  width: 100%;
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 13px;
+  letter-spacing: 0.04em;
+}
+.nav__mlink--toggle svg {
+  width: 15px;
+  height: 15px;
+  flex: 0 0 auto;
+}
+
+/* Navbar 토글 — 토큰 기반으로 자동 대응 */
+.nav .toggle {
+  background: var(--card);
+  border-color: var(--border);
+  box-shadow: var(--shadow);
+}
+.nav .toggle__icon {
+  color: var(--ink-soft);
+}
+.nav .toggle__knob {
+  background: var(--cyan);
+  box-shadow: 0 0 10px var(--glow), 0 1px 2px rgba(0, 0, 0, 0.28);
+}
+
+/* 좁은 화면: 데스크탑 메뉴 숨기고 햄버거+모바일 토글 노출 */
+@media (max-width: 720px) {
+  .nav__menu {
+    display: none;
+  }
+  .nav__burger {
+    display: flex;
+  }
+  .nav__toggle-mobile {
+    display: flex;
+    margin-left: auto;
+  }
+}
+
+/* ---------- 배경 장식 ---------- */
+.deco {
+  position: absolute;
+  pointer-events: none;
+}
+.deco--tl {
+  top: -26px;
+  left: -34px;
+  opacity: 0.16;
+}
+.deco--br {
+  bottom: -30px;
+  right: -36px;
+  opacity: 0.13;
+  transform: rotate(180deg);
+}
+
+/* ---------- 허브 컨테이너 ---------- */
+.hub {
+  position: relative;
+  min-height: 100vh;
+  min-height: 100dvh;
+  overflow: hidden;
+  color: var(--ink);
+  transition: background-color 0.45s ease, color 0.45s ease;
+  background-color: var(--paper);
+  background-image:
+    linear-gradient(var(--grid) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid) 1px, transparent 1px),
+    linear-gradient(var(--grid-strong) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid-strong) 1px, transparent 1px);
+  background-size: 26px 26px, 26px 26px, 130px 130px, 130px 130px;
+}
+
+.main {
+  position: relative;
+  z-index: 1;
+  max-width: 460px;
+  margin: 0 auto;
+  padding: 24px 20px 44px;
+}
+
+/* ---------- 상단 바 ---------- */
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.rec {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 10.5px;
+  letter-spacing: 0.14em;
+  color: var(--ink-soft);
+}
+.rec__dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--cyan);
+  box-shadow: 0 0 8px var(--glow);
+}
+
+/* ---------- 테마 토글 ---------- */
+.toggle {
+  position: relative;
+  width: 64px;
+  height: 34px;
+  flex: 0 0 auto;
+  border-radius: 999px;
+  background: var(--card-2);
+  border: 1px solid var(--border);
+  cursor: pointer;
+  padding: 0;
+  box-shadow: var(--shadow);
+  transition: background 0.3s, border-color 0.3s;
+}
+.toggle:focus-visible {
+  outline: 2px solid var(--cyan);
+  outline-offset: 3px;
+}
+.toggle__icon {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--ink-soft);
+  display: flex;
+}
+.toggle__icon--sun {
+  left: 9px;
+}
+.toggle__icon--moon {
+  right: 9px;
+}
+.toggle__knob {
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  background: var(--cyan);
+  box-shadow: 0 0 10px var(--glow), 0 1px 2px rgba(0, 0, 0, 0.28);
+  transition: transform 0.3s cubic-bezier(0.4, 1.25, 0.5, 1);
+}
+[data-theme='dark'] .toggle__knob {
+  transform: translateX(30px);
+}
+
+/* ---------- 히어로 ---------- */
+.hero {
+  text-align: center;
+  margin-top: 22px;
+}
+.avatar {
+  position: relative;
+  width: 212px;
+  height: 212px;
+  margin: 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.avatar__rings {
+  position: absolute;
+  inset: 0;
+  animation: spin-slow 90s linear infinite;
+}
+.avatar__inner {
+  position: relative;
+  width: 134px;
+  height: 134px;
+  animation: floaty 6.5s ease-in-out infinite;
+}
+.avatar__clip {
+  width: 134px;
+  height: 134px;
+  border-radius: 50%;
+  overflow: hidden;
+  box-shadow: 0 0 0 4px var(--card), 0 0 0 5px var(--border), 0 16px 32px var(--glow);
+}
+.avatar__img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.avatar__ph {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--card-2);
+}
+.avatar__ph span {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  color: var(--ink-soft);
+  text-align: center;
+  padding: 0 12px;
+}
+.atom-pin {
+  position: absolute;
+  right: 0;
+  bottom: 2px;
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  background: var(--card);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--accent-text);
+}
+
+.name {
+  font-family: 'Sora', 'Noto Sans KR', sans-serif;
+  font-weight: 700;
+  font-size: 31px;
+  line-height: 1.08;
+  letter-spacing: -0.01em;
+  margin: 18px 0 0;
+  color: var(--ink);
+}
+.name em {
+  font-style: normal;
+  color: var(--accent-text);
+  font-weight: 600;
+}
+.tagline {
+  margin: 10px auto 0;
+  max-width: 280px;
+  font-size: 14.5px;
+  line-height: 1.55;
+  color: var(--ink-soft);
+}
+.chips {
+  display: flex;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 7px;
+  margin-top: 15px;
+}
+.chip {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 10.5px;
+  letter-spacing: 0.03em;
+  white-space: nowrap;
+  color: var(--ink-soft);
+  padding: 5px 11px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--card-2);
+}
+
+.divider {
+  display: block;
+  width: 100%;
+  height: 26px;
+  margin: 26px 0 4px;
+  opacity: 0.55;
+}
+
+/* ---------- 섹션 헤더 ---------- */
+.section-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 18px 2px 14px;
+}
+.section-head > span:first-child {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 11px;
+  letter-spacing: 0.18em;
+  color: var(--ink-soft);
+}
+.section-head .line {
+  flex: 1;
+  height: 1px;
+  background: linear-gradient(90deg, var(--border), transparent);
+}
+
+/* ---------- 메인 링크 ---------- */
+.links {
+  display: flex;
+  flex-direction: column;
+  gap: 11px;
+}
+.link-card {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 13px 15px;
+  min-height: 66px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 15px;
+  color: var(--ink);
+  text-decoration: none;
+  box-shadow: var(--shadow);
+  transition: transform 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease;
+  position: relative;
+}
+.link-card:hover {
+  transform: translateY(-2px);
+  border-color: var(--cyan);
+  box-shadow: 0 0 0 1px var(--cyan), 0 12px 30px var(--glow);
+}
+.link-card:focus-visible {
+  outline: 2px solid var(--cyan);
+  outline-offset: 3px;
+}
+.link-card__tile {
+  position: relative;
+  flex: 0 0 auto;
+  width: 46px;
+  height: 46px;
+  border-radius: 12px;
+  background: var(--tile);
+  color: var(--tile-ink);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.link-card__tile .dot {
+  position: absolute;
+  top: 5px;
+  right: 5px;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--cyan);
+  opacity: 0.65;
+}
+.link-card__text {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+  flex: 1;
+}
+.link-card__label {
+  font-family: 'Sora', 'Noto Sans KR', sans-serif;
+  font-weight: 600;
+  font-size: 16px;
+  line-height: 1.2;
+}
+.link-card__sub {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 11px;
+  letter-spacing: 0.01em;
+  color: var(--ink-soft);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.link-card__arrow {
+  flex: 0 0 auto;
+  color: var(--ink-soft);
+  display: flex;
+}
+
+/* ---------- 확장 슬롯 ---------- */
+.slots {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 11px;
+}
+.slot {
+  border: 1.5px dashed var(--border);
+  border-radius: 15px;
+  padding: 14px 15px;
+  min-height: 94px;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  gap: 10px;
+  opacity: 0.9;
+}
+.slot__head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+.slot__icon {
+  flex: 0 0 auto;
+  width: 26px;
+  height: 26px;
+  border-radius: 8px;
+  border: 1.5px dashed var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--ink-soft);
+}
+.slot__label {
+  font-family: 'Sora', 'Noto Sans KR', sans-serif;
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--ink-soft);
+  line-height: 1.25;
+}
+.slot__note {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 9.5px;
+  letter-spacing: 0.12em;
+  color: var(--ink-soft);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.slot__note .ndot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--mustard);
+}
+
+/* ---------- 푸터 ---------- */
+.footer {
+  margin-top: 30px;
+}
+.footer__wave {
+  display: block;
+  width: 100%;
+  height: 14px;
+  opacity: 0.45;
+}
+.footer__inner {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 13px;
+  margin-top: 18px;
+}
+.footer__socials {
+  display: flex;
+  gap: 18px;
+  color: var(--ink-soft);
+}
+.footer__socials a {
+  color: inherit;
+  display: flex;
+  transition: color 0.18s ease;
+}
+.footer__socials a:hover {
+  color: var(--cyan);
+}
+.footer__copy {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  color: var(--ink-soft);
+}
+.footer__sub {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 9.5px;
+  letter-spacing: 0.12em;
+  color: var(--ink-soft);
+  opacity: 0.7;
+}
+
+/* ---------- 애니메이션 ---------- */
+@keyframes floaty {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-5px);
+  }
+}
+@keyframes spin-slow {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .avatar__rings,
+  .avatar__inner,
+  .hub {
+    animation: none !important;
+    transition: none !important;
+  }
+}
+
+/* ============================================================
+   블록 카드 시스템 (design-system/blocks.tsx) — About 등 "블록카드식" 페이지
+   ============================================================ */
+
+/* 작은 알약형 링크(상단 바 등) */
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 10.5px;
+  letter-spacing: 0.04em;
+  color: var(--accent-text);
+  text-decoration: none;
+  padding: 5px 11px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--card-2);
+  white-space: nowrap;
+  transition: border-color 0.18s ease;
+}
+.pill:hover {
+  border-color: var(--cyan);
+}
+
+/* About 헤더 (작은 아바타 + 메타) */
+.about-head {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin-top: 24px;
+}
+.about-head__media {
+  position: relative;
+  width: 84px;
+  height: 84px;
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.about-head__rings {
+  position: absolute;
+  inset: 0;
+  animation: spin-slow 90s linear infinite;
+}
+.about-head__clip {
+  width: 62px;
+  height: 62px;
+  border-radius: 50%;
+  overflow: hidden;
+  box-shadow: 0 0 0 3px var(--card), 0 0 0 4px var(--border), 0 10px 22px var(--glow);
+}
+.about-head__ph {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--card-2);
+}
+.about-head__ph span {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 9px;
+  letter-spacing: 0.04em;
+  color: var(--ink-soft);
+}
+.about-head__eyebrow {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 10px;
+  letter-spacing: 0.2em;
+  color: var(--ink-soft);
+}
+.about-head__name {
+  font-family: 'Sora', 'Noto Sans KR', sans-serif;
+  font-weight: 700;
+  font-size: 27px;
+  line-height: 1.1;
+  letter-spacing: -0.01em;
+  margin: 5px 0 0;
+  color: var(--ink);
+}
+.about-head__name em {
+  font-style: normal;
+  color: var(--accent-text);
+  font-weight: 600;
+}
+.about-head__tag {
+  margin: 6px 0 0;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--ink-soft);
+}
+
+/* ---------- 블록 그리드 + 셸 ---------- */
+.block-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin-top: 14px;
+}
+.block {
+  position: relative;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 18px 20px;
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+.block--full {
+  grid-column: 1 / -1;
+}
+.block--lead {
+  padding: 20px 20px 22px;
+}
+.block--dashed {
+  background: none;
+  border: 1.5px dashed var(--border);
+  box-shadow: none;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.block__bar {
+  position: absolute;
+  top: 0;
+  left: 20px;
+  width: 34px;
+  height: 3px;
+  border-radius: 0 0 3px 3px;
+}
+.block__label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 13px;
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 11px;
+  letter-spacing: 0.16em;
+  color: var(--ink-soft);
+}
+.block__label--code {
+  font-size: 9.5px;
+  letter-spacing: 0.18em;
+  margin-bottom: 11px;
+}
+.block__label-ico {
+  display: flex;
+}
+.block__lead {
+  margin: 0;
+  font-family: 'Sora', 'Noto Sans KR', sans-serif;
+  font-weight: 600;
+  font-size: 19px;
+  line-height: 1.45;
+  letter-spacing: -0.01em;
+  color: var(--ink);
+  text-wrap: pretty;
+}
+.block__text {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.72;
+  color: var(--ink-soft);
+  text-wrap: pretty;
+}
+.block__empty {
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--ink-faint);
+}
+.block__empty-ico {
+  flex: 0 0 auto;
+  width: 30px;
+  height: 30px;
+  border-radius: 9px;
+  border: 1.5px dashed var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--ink-faint);
+}
+
+/* key-value 테이블 */
+.kv {
+  display: flex;
+  flex-direction: column;
+}
+.kv__row {
+  display: flex;
+  align-items: baseline;
+  gap: 14px;
+  padding: 9px 0;
+  border-top: 1px solid var(--border);
+}
+.kv__k {
+  flex: 0 0 88px;
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  color: var(--ink-soft);
+}
+.kv__v {
+  flex: 1;
+  font-size: 14px;
+  line-height: 1.45;
+  color: var(--ink);
+  font-weight: 500;
+}
+
+/* 태그 묶음 */
+.tagrow {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+.tag {
+  font-family: 'Noto Sans KR', sans-serif;
+  font-size: 12.5px;
+  font-weight: 500;
+  white-space: nowrap;
+  color: var(--ink);
+  padding: 5px 12px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--card-2);
+}
+
+/* ============================================================
+   디자인 시스템 유틸리티 클래스 (designsystem/globals.css)
+   ============================================================ */
+
+.ds-link-card {
+  transition: transform 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease;
+}
+.ds-link-card:hover {
+  transform: translateY(-2px);
+  border-color: var(--cyan) !important;
+  box-shadow: 0 0 0 1px var(--cyan), 0 12px 30px var(--glow) !important;
+}
+.ds-pill {
+  transition: border-color 0.18s ease;
+}
+.ds-pill:hover {
+  border-color: var(--cyan) !important;
+}
+
+.ds-card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  box-shadow: var(--shadow);
+}
+.ds-grid-2 {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 12px;
+}
+.ds-grid-3 {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+}
+.ds-grid-4 {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 12px;
+}
+
+@media (max-width: 720px) {
+  .ds-grid-2 {
+    grid-template-columns: 1fr;
+  }
+  .ds-grid-3 {
+    grid-template-columns: 1fr;
+  }
+  .ds-grid-4 {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+
+/* 디자인 시스템 섹션 헤더 (번호 + 라벨 + 페이드 라인) */
+.ds-section-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 18px;
+}
+.ds-section-head__no {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 11px;
+  letter-spacing: 0.18em;
+  color: var(--accent-text);
+}
+.ds-section-head__label {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 11px;
+  letter-spacing: 0.18em;
+  color: var(--ink-soft);
+}
+.ds-section-head__line {
+  flex: 1;
+  height: 1px;
+  background: linear-gradient(90deg, var(--border), transparent);
+}
+
+/* 디자인 시스템 카드 레이블 (모노 소문자) */
+.ds-card-label {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  color: var(--ink-soft);
+}

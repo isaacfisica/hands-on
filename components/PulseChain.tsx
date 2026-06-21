@@ -1,0 +1,1685 @@
+'use client';
+
+import React, { useMemo, useRef, useEffect, useState, useCallback } from "react";
+
+/* =========================================================================
+   REAL DSP CORE  (no faked numbers — everything below is actual computation)
+   ========================================================================= */
+
+// In-place iterative radix-2 Cooley–Tukey FFT. inverse=true → IFFT (1/N scaled).
+function fft(re: Float64Array, im: Float64Array, inverse: boolean): void {
+  const n = re.length;
+  for (let i = 1, j = 0; i < n; i++) {
+    let bit = n >> 1;
+    for (; j & bit; bit >>= 1) j ^= bit;
+    j ^= bit;
+    if (i < j) {
+      const tr = re[i]; re[i] = re[j]; re[j] = tr;
+      const ti = im[i]; im[i] = im[j]; im[j] = ti;
+    }
+  }
+  for (let len = 2; len <= n; len <<= 1) {
+    const ang = ((inverse ? 2 : -2) * Math.PI) / len;
+    const wr = Math.cos(ang), wi = Math.sin(ang);
+    const half = len >> 1;
+    for (let i = 0; i < n; i += len) {
+      let cr = 1, ci = 0;
+      for (let k = 0; k < half; k++) {
+        const a = i + k, b = i + k + half;
+        const vr = re[b] * cr - im[b] * ci;
+        const vi = re[b] * ci + im[b] * cr;
+        re[b] = re[a] - vr; im[b] = im[a] - vi;
+        re[a] = re[a] + vr; im[a] = im[a] + vi;
+        const ncr = cr * wr - ci * wi;
+        ci = cr * wi + ci * wr; cr = ncr;
+      }
+    }
+  }
+  if (inverse) for (let i = 0; i < n; i++) { re[i] /= n; im[i] /= n; }
+}
+
+// CR high-pass:  H = jωτ /(1+jωτ)
+function Hcr(omega: number, tau: number): [number, number] {
+  const a = omega * tau, d = 1 + a * a;
+  return [(a * a) / d, a / d];
+}
+// RC low-pass:   H = 1   /(1+jωτ)
+function Hlp(omega: number, tau: number): [number, number] {
+  const a = omega * tau, d = 1 + a * a;
+  return [1 / d, -a / d];
+}
+
+// Bi-exponential detector pulse: A·(e^{-t/τf} − e^{-t/τr}), causal from t0.
+function makePulse(
+  N: number,
+  dt: number,
+  { t0, tr, tf, amp }: { t0: number; tr: number; tf: number; amp: number }
+): Float64Array {
+  const x = new Float64Array(N);
+  const tp = ((tr * tf) / (tf - tr)) * Math.log(tf / tr);
+  const peak = Math.exp(-tp / tf) - Math.exp(-tp / tr);
+  for (let n = 0; n < N; n++) {
+    const t = n * dt - t0;
+    if (t < 0) continue;
+    x[n] = (amp / peak) * (Math.exp(-t / tf) - Math.exp(-t / tr));
+  }
+  return x;
+}
+
+// Frequency-domain filtering: FFT → ×H(jω) → IFFT.
+function freqFilter(
+  x: Float64Array,
+  dt: number,
+  hfns: ((w: number) => [number, number])[]
+): Float64Array {
+  const n = x.length;
+  const re = Float64Array.from(x), im = new Float64Array(n);
+  fft(re, im, false);
+  for (let k = 0; k < n; k++) {
+    const f = (k <= n / 2 ? k : k - n) / (n * dt);
+    const w = 2 * Math.PI * f;
+    let hr = 1, hi = 0;
+    for (const h of hfns) {
+      const [r, i] = h(w);
+      const nr = hr * r - hi * i;
+      hi = hr * i + hi * r; hr = nr;
+    }
+    const ar = re[k], ai = im[k];
+    re[k] = ar * hr - ai * hi;
+    im[k] = ar * hi + ai * hr;
+  }
+  fft(re, im, true);
+  return re;
+}
+
+// Bilinear-transform IIR (CR high-pass)
+function iirCR(x: Float64Array, tau: number, dt: number): Float64Array {
+  const k = (2 * tau) / dt, g = 1 / (1 + k);
+  const b0 = k * g, b1 = -k * g, a1 = (1 - k) * g;
+  const y = new Float64Array(x.length);
+  for (let n = 1; n < x.length; n++)
+    y[n] = b0 * x[n] + b1 * x[n - 1] - a1 * y[n - 1];
+  return y;
+}
+// Bilinear-transform IIR (RC low-pass)
+function iirRC(x: Float64Array, tau: number, dt: number): Float64Array {
+  const k = (2 * tau) / dt, g = 1 / (1 + k);
+  const b = g, a1 = (1 - k) * g;
+  const y = new Float64Array(x.length);
+  y[0] = b * x[0];
+  for (let n = 1; n < x.length; n++)
+    y[n] = b * x[n] + b * x[n - 1] - a1 * y[n - 1];
+  return y;
+}
+
+// Leading-edge discriminator
+function discriminate(x: Float64Array, th: number): { over: Uint8Array; edges: number[] } {
+  const N = x.length;
+  const over = new Uint8Array(N);
+  const edges: number[] = [];
+  for (let n = 1; n < N; n++) {
+    over[n] = x[n] >= th ? 1 : 0;
+    if (x[n - 1] < th && x[n] >= th) edges.push(n);
+  }
+  return { over, edges };
+}
+
+interface AcceptedEvent {
+  start: number;
+  gateEnd: number;
+  pile: boolean;
+}
+
+interface DualTimerResult {
+  gate: Uint8Array;
+  veto: Uint8Array;
+  accepted: AcceptedEvent[];
+  rejected: number;
+  pileup: number;
+}
+
+// Dual timer + veto
+function dualTimer(
+  edges: number[],
+  N: number,
+  gateS: number,
+  vetoS: number
+): DualTimerResult {
+  const gate = new Uint8Array(N);
+  const veto = new Uint8Array(N);
+  const accepted: AcceptedEvent[] = [];
+  let gateEnd = -1, vetoEnd = -1, rejected = 0, pileup = 0;
+  let curEvt: AcceptedEvent | null = null;
+  for (const e of edges) {
+    if (e < vetoEnd) {
+      rejected++;
+      if (curEvt && e < curEvt.gateEnd && !curEvt.pile) { curEvt.pile = true; pileup++; }
+      continue;
+    }
+    gateEnd = e + gateS; vetoEnd = e + vetoS;
+    curEvt = { start: e, gateEnd, pile: false };
+    accepted.push(curEvt);
+    for (let n = e; n < Math.min(N, gateEnd); n++) gate[n] = 1;
+    for (let n = e; n < Math.min(N, vetoEnd); n++) veto[n] = 1;
+  }
+  return { gate, veto, accepted, rejected, pileup };
+}
+
+const sum = (x: Float64Array, a: number, b: number): number => {
+  let s = 0;
+  for (let n = a; n < b; n++) s += x[n];
+  return s;
+};
+
+/* =========================================================================
+   FORMATTING
+   ========================================================================= */
+const fmtT = (s: number): string =>
+  s >= 1e-6 ? (s * 1e6).toFixed(2) + " µs"
+  : s >= 1e-9 ? (s * 1e9).toFixed(0) + " ns"
+  : (s * 1e12).toFixed(0) + " ps";
+const fmtNs = (s: number): string => Math.round(s * 1e9) + " ns";
+void fmtNs; // used in display context
+
+/* =========================================================================
+   CHANNEL PALETTE (Tektronix-style per-stage colours)
+   ========================================================================= */
+const C = {
+  bg: "#0a0d12", panel: "#11161d", bezel: "#1b222c", screen: "#07090d",
+  grid: "#161d27", gridHot: "#1f2a39",
+  ink: "#c9d4e0", dim: "#5d6b7d", label: "#8794a6",
+  ch1: "#f2c14e", ch2: "#3fd0d8", ch3: "#e86fc0", ch4: "#7ad96b",
+  warn: "#ff6b5e", veto: "#ff4d4d", gate: "#7ad96b",
+};
+
+// CSS variable references for the UI shell (panels, text, borders) — adapts to light/dark theme.
+// Canvas drawing still uses C (always-dark oscilloscope aesthetic).
+const T = {
+  bg:      "var(--paper)",
+  card:    "var(--card)",
+  card2:   "var(--card-2)",
+  border:  "var(--border)",
+  shadow:  "var(--shadow)",
+  ink:     "var(--ink)",
+  soft:    "var(--ink-soft)",
+  faint:   "var(--ink-faint)",
+  cyan:    "var(--cyan)",
+};
+
+/* =========================================================================
+   TYPES
+   ========================================================================= */
+interface ScopeData {
+  input: Float64Array;
+  hp_iir: Float64Array;
+  shaped_iir: Float64Array;
+  hp_fft: Float64Array;
+  shaped_fft: Float64Array;
+  over: Uint8Array;
+  gate: Uint8Array;
+  veto: Uint8Array;
+}
+
+interface SpecData {
+  in: Float64Array;
+  hp: Float64Array;
+  shaped: Float64Array;
+  Hcr: Float64Array;
+  Hlp: Float64Array;
+}
+
+/* =========================================================================
+   SCOPE (multi-lane time-domain display)
+   ========================================================================= */
+function Scope({
+  data,
+  dt,
+  threshold,
+  sweep,
+  showFFTpath,
+}: {
+  data: ScopeData;
+  dt: number;
+  threshold: number;
+  sweep: number;
+  showFFTpath: boolean;
+}) {
+  const ref = useRef<HTMLCanvasElement>(null);
+  useEffect(() => {
+    const cv = ref.current; if (!cv) return;
+    const dpr = window.devicePixelRatio || 1;
+    const W = cv.clientWidth, H = cv.clientHeight;
+    cv.width = W * dpr; cv.height = H * dpr;
+    const g = cv.getContext("2d")!; g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    g.clearRect(0, 0, W, H);
+
+    const N = data.input.length, T = N * dt;
+    const padL = 52, padR = 10, padT = 6, padB = 18;
+    const plotW = W - padL - padR, plotH = H - padT - padB;
+    const xAt = (n: number) => padL + (n / (N - 1)) * plotW;
+
+    g.strokeStyle = C.grid; g.lineWidth = 1;
+    const divX = 8;
+    g.font = "9px ui-monospace, Menlo, monospace"; g.fillStyle = C.dim; g.textAlign = "center";
+    for (let i = 0; i <= divX; i++) {
+      const x = padL + (i / divX) * plotW;
+      g.beginPath(); g.moveTo(x, padT); g.lineTo(x, padT + plotH); g.stroke();
+      g.fillText(fmtT((i / divX) * T), x, H - 5);
+    }
+
+    const lanes = [
+      { key: "input" as const, label: "INPUT", color: C.ch1, fft: "hp_fft" as const },
+      { key: "hp_iir" as const, label: "HPF (CR)", color: C.ch2, fft: "hp_fft" as const },
+      { key: "shaped_iir" as const, label: "SHAPED", color: C.ch4, fft: "shaped_fft" as const },
+    ];
+    const laneH = plotH / 4;
+
+    lanes.forEach((ln, idx) => {
+      const y0 = padT + idx * laneH;
+      const cy = y0 + laneH * 0.5;
+      g.strokeStyle = C.gridHot; g.lineWidth = 1;
+      g.beginPath(); g.moveTo(padL, cy); g.lineTo(padL + plotW, cy); g.stroke();
+      g.fillStyle = ln.color; g.textAlign = "right"; g.font = "10px ui-monospace, Menlo, monospace";
+      g.fillText(ln.label, padL - 6, y0 + 12);
+
+      const arr = data[ln.key];
+      let mx = 1e-12;
+      for (let n = 0; n < N; n++) mx = Math.max(mx, Math.abs(arr[n]));
+      const yAt = (v: number) => cy - (v / mx) * laneH * 0.42;
+      const clip = Math.floor((N - 1) * sweep);
+
+      if (ln.key === "shaped_iir") {
+        g.strokeStyle = "rgba(255,107,94,0.55)"; g.setLineDash([4, 4]); g.lineWidth = 1;
+        g.beginPath(); g.moveTo(padL, yAt(threshold)); g.lineTo(padL + plotW, yAt(threshold)); g.stroke();
+        g.setLineDash([]);
+        g.fillStyle = "rgba(255,107,94,0.8)"; g.textAlign = "left"; g.font = "8px ui-monospace, monospace";
+        g.fillText("thr", padL + 3, yAt(threshold) - 3);
+      }
+
+      if (showFFTpath && data[ln.fft]) {
+        const f = data[ln.fft];
+        g.strokeStyle = ln.color + "66"; g.setLineDash([2, 3]); g.lineWidth = 1;
+        g.beginPath();
+        for (let n = 0; n <= clip; n++) {
+          const x = xAt(n), y = yAt(f[n]);
+          n ? g.lineTo(x, y) : g.moveTo(x, y);
+        }
+        g.stroke(); g.setLineDash([]);
+      }
+      g.shadowColor = ln.color; g.shadowBlur = 6;
+      g.strokeStyle = ln.color; g.lineWidth = 1.4;
+      g.beginPath();
+      for (let n = 0; n <= clip; n++) {
+        const x = xAt(n), y = yAt(arr[n]);
+        n ? g.lineTo(x, y) : g.moveTo(x, y);
+      }
+      g.stroke(); g.shadowBlur = 0;
+    });
+
+    // logic lane
+    {
+      const y0 = padT + 3 * laneH;
+      g.fillStyle = C.label; g.textAlign = "right"; g.font = "10px ui-monospace, Menlo, monospace";
+      g.fillText("LOGIC", padL - 6, y0 + 12);
+      const top = y0 + laneH * 0.30, bot = y0 + laneH * 0.78;
+      const clip = Math.floor((N - 1) * sweep);
+      const band = (arr: Uint8Array, color: string, yT: number, yB: number, fill: boolean) => {
+        g.strokeStyle = color; g.lineWidth = 1.3;
+        if (fill) g.fillStyle = color + "22";
+        g.beginPath();
+        let prev = 0;
+        for (let n = 0; n <= clip; n++) {
+          const x = xAt(n), y = arr[n] ? yT : yB;
+          if (n === 0) g.moveTo(x, y);
+          else {
+            if (arr[n] !== prev) g.lineTo(x, prev ? yB : yT);
+            g.lineTo(x, y);
+          }
+          prev = arr[n];
+        }
+        g.stroke();
+        if (fill) {
+          g.beginPath(); g.moveTo(xAt(0), yB);
+          for (let n = 0; n <= clip; n++) g.lineTo(xAt(n), arr[n] ? yT : yB);
+          g.lineTo(xAt(clip), yB); g.closePath(); g.fill();
+        }
+      };
+      band(data.veto, C.veto, top - 2, bot, false);
+      band(data.gate, C.gate, top, bot, true);
+      g.strokeStyle = C.ink; g.lineWidth = 1.2;
+      g.beginPath();
+      let prev = 0;
+      for (let n = 0; n <= clip; n++) {
+        const x = xAt(n), y = data.over[n] ? top : bot;
+        if (n === 0) g.moveTo(x, y);
+        else {
+          if (data.over[n] !== prev) g.lineTo(x, prev ? bot : top);
+          g.lineTo(x, y);
+        }
+        prev = data.over[n];
+      }
+      g.stroke();
+      g.font = "8px ui-monospace, monospace"; g.textAlign = "left";
+      g.fillStyle = C.gate; g.fillText("gate", padL + 3, bot + 1);
+      g.fillStyle = C.veto; g.fillText("veto", padL + 34, bot + 1);
+      g.fillStyle = C.ink; g.fillText("disc", padL + 66, bot + 1);
+    }
+  });
+  return <canvas ref={ref} style={{ width: "100%", height: "100%", display: "block" }} />;
+}
+
+/* =========================================================================
+   SPECTRUM (log-f, dB)
+   ========================================================================= */
+function Spectrum({ spec, dt }: { spec: SpecData; dt: number }) {
+  const ref = useRef<HTMLCanvasElement>(null);
+  useEffect(() => {
+    const cv = ref.current; if (!cv) return;
+    const dpr = window.devicePixelRatio || 1;
+    const W = cv.clientWidth, H = cv.clientHeight;
+    cv.width = W * dpr; cv.height = H * dpr;
+    const g = cv.getContext("2d")!; g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    g.clearRect(0, 0, W, H);
+
+    const padL = 38, padR = 8, padT = 8, padB = 18;
+    const pw = W - padL - padR, ph = H - padT - padB;
+    const fmin = 1e5, fmax = 0.5 / dt;
+    const dbMax = 6, dbMin = -66;
+    const xAt = (f: number) =>
+      padL + ((Math.log10(f) - Math.log10(fmin)) / (Math.log10(fmax) - Math.log10(fmin))) * pw;
+    const yAt = (db: number) => padT + (dbMax - db) / (dbMax - dbMin) * ph;
+
+    g.font = "8px ui-monospace, monospace"; g.textAlign = "center";
+    for (let d = 5; d <= 8; d++) {
+      const f = Math.pow(10, d);
+      if (f < fmin || f > fmax) continue;
+      g.strokeStyle = C.gridHot; g.lineWidth = 1;
+      g.beginPath(); g.moveTo(xAt(f), padT); g.lineTo(xAt(f), padT + ph); g.stroke();
+      const lbl = f >= 1e9 ? (f / 1e9) + "G" : f >= 1e6 ? (f / 1e6) + "M" : (f / 1e3) + "k";
+      g.fillStyle = C.dim; g.fillText(lbl + "Hz", xAt(f), H - 5);
+    }
+    g.textAlign = "right"; g.strokeStyle = C.grid;
+    for (let db = 0; db >= -60; db -= 20) {
+      g.beginPath(); g.moveTo(padL, yAt(db)); g.lineTo(padL + pw, yAt(db)); g.stroke();
+      g.fillStyle = C.dim; g.fillText(db + "dB", padL - 3, yAt(db) + 3);
+    }
+
+    const curve = (mag: Float64Array, color: string, w: number, dash?: number[]) => {
+      g.strokeStyle = color; g.lineWidth = w;
+      if (dash) g.setLineDash(dash);
+      g.beginPath(); let started = false;
+      for (let k = 1; k < mag.length; k++) {
+        const f = k / (mag.length * 2 * dt);
+        if (f < fmin) continue;
+        const db = 20 * Math.log10(mag[k] + 1e-12);
+        const x = xAt(f), y = Math.max(padT, Math.min(padT + ph, yAt(db)));
+        started ? g.lineTo(x, y) : (g.moveTo(x, y), started = true);
+      }
+      g.stroke(); g.setLineDash([]);
+    };
+    curve(spec.Hcr, C.ch2 + "99", 1, [3, 3]);
+    curve(spec.Hlp, C.ch4 + "99", 1, [3, 3]);
+    curve(spec.in, C.ch1, 1.4);
+    curve(spec.hp, C.ch2, 1.4);
+    curve(spec.shaped, C.ch4, 1.6);
+
+    g.font = "9px ui-monospace, monospace"; g.textAlign = "left";
+    const leg: [string, string][] = [["input", C.ch1], ["·Hcr", C.ch2], ["·Hcr·Hlp", C.ch4]];
+    let lx = padL + 6;
+    leg.forEach(([t, c]) => { g.fillStyle = c; g.fillText(t, lx, padT + 10); lx += g.measureText(t).width + 14; });
+  });
+  return <canvas ref={ref} style={{ width: "100%", height: "100%", display: "block" }} />;
+}
+
+/* =========================================================================
+   CONTROLS
+   ========================================================================= */
+function Fader({
+  label,
+  value,
+  min,
+  max,
+  step,
+  onChange,
+  fmt,
+  color,
+}: {
+  label: string;
+  value: number;
+  min: number;
+  max: number;
+  step: number;
+  onChange: (v: number) => void;
+  fmt: (v: number) => string;
+  color?: string;
+}) {
+  return (
+    <label style={{ display: "block", marginBottom: 11 }}>
+      <div
+        style={{
+          display: "flex",
+          justifyContent: "space-between",
+          fontSize: 10,
+          letterSpacing: 0.5,
+          marginBottom: 3,
+        }}
+      >
+        <span style={{ color: T.soft }}>{label}</span>
+        <span style={{ color: color || T.ink, fontFamily: "'IBM Plex Mono', monospace" }}>
+          {fmt(value)}
+        </span>
+      </div>
+      <input
+        className="fdr"
+        type="range"
+        min={min}
+        max={max}
+        step={step}
+        value={value}
+        onChange={(e) => onChange(parseFloat(e.target.value))}
+        style={{ accentColor: color || T.cyan }}
+      />
+    </label>
+  );
+}
+
+function Stat({
+  label,
+  value,
+  color,
+  sub,
+}: {
+  label: string;
+  value: string | number;
+  color?: string;
+  sub?: string;
+}) {
+  return (
+    <div
+      style={{
+        background: T.card2,
+        border: `1px solid ${T.border}`,
+        borderRadius: 6,
+        padding: "7px 9px",
+      }}
+    >
+      <div
+        style={{
+          fontSize: 9,
+          color: T.soft,
+          letterSpacing: 0.6,
+          textTransform: "uppercase",
+          fontFamily: "'IBM Plex Mono', monospace",
+        }}
+      >
+        {label}
+      </div>
+      <div
+        style={{
+          fontFamily: "'IBM Plex Mono', monospace",
+          fontSize: 17,
+          color: color || T.ink,
+          marginTop: 2,
+        }}
+      >
+        {value}
+      </div>
+      {sub && (
+        <div style={{ fontSize: 9, color: T.faint, fontFamily: "'IBM Plex Mono', monospace" }}>
+          {sub}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* =========================================================================
+   ANALYZER TAB
+   ========================================================================= */
+interface AnalyzerParams {
+  amp: number;
+  tr: number;
+  tf: number;
+  t0: number;
+  dbl: boolean;
+  sep: number;
+  tauCR: number;
+  tauRC: number;
+  thr: number;
+  gate: number;
+  veto: number;
+  fftPath: boolean;
+}
+
+function AnalyzerTab() {
+  const N = 4096, dt = 1e-9;
+
+  const [p, setP] = useState<AnalyzerParams>({
+    amp: 1, tr: 10, tf: 100, t0: 400,
+    dbl: true, sep: 250,
+    tauCR: 200, tauRC: 50,
+    thr: 0.30,
+    gate: 300, veto: 600,
+    fftPath: true,
+  });
+  const set = (k: keyof AnalyzerParams) => (v: number | boolean) =>
+    setP((s) => ({ ...s, [k]: v }));
+
+  const [sweep, setSweep] = useState(1);
+  const rafRef = useRef(0);
+  const fire = useCallback(() => {
+    const reduce =
+      window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    if (reduce) { setSweep(1); return; }
+    cancelAnimationFrame(rafRef.current);
+    const t0 = performance.now(), dur = 520;
+    const step = (t: number) => {
+      const k = Math.min(1, (t - t0) / dur);
+      setSweep(k);
+      if (k < 1) rafRef.current = requestAnimationFrame(step);
+    };
+    setSweep(0); rafRef.current = requestAnimationFrame(step);
+  }, []);
+  useEffect(() => () => cancelAnimationFrame(rafRef.current), []);
+
+  const R = useMemo(() => {
+    const tr = p.tr * 1e-9, tf = p.tf * 1e-9, t0 = p.t0 * 1e-9;
+    let input = makePulse(N, dt, { t0, tr, tf, amp: p.amp });
+    if (p.dbl) {
+      const p2 = makePulse(N, dt, { t0: t0 + p.sep * 1e-9, tr, tf, amp: p.amp });
+      for (let n = 0; n < N; n++) input[n] += p2[n];
+    }
+
+    const tauCR = p.tauCR * 1e-9, tauRC = p.tauRC * 1e-9;
+    const hp_fft = freqFilter(input, dt, [(w) => Hcr(w, tauCR)]);
+    const shaped_fft = freqFilter(input, dt, [(w) => Hcr(w, tauCR), (w) => Hlp(w, tauRC)]);
+    const hp_iir = iirCR(input, tauCR, dt);
+    const shaped_iir = iirRC(hp_iir, tauRC, dt);
+
+    let pk = 1e-12, sse = 0;
+    for (let n = 0; n < N; n++) {
+      pk = Math.max(pk, Math.abs(shaped_iir[n]));
+      const d = shaped_iir[n] - shaped_fft[n];
+      sse += d * d;
+    }
+    const rms = Math.sqrt(sse / N) / pk;
+
+    const thr = p.thr * pk;
+    const { over, edges } = discriminate(shaped_iir, thr);
+    const gateS = Math.round(p.gate), vetoS = Math.round(p.veto);
+    const { gate, veto, accepted, rejected, pileup } = dualTimer(edges, N, gateS, vetoS);
+
+    const Qref = (() => {
+      const single = makePulse(N, dt, { t0: p.t0 * 1e-9, tr, tf, amp: p.amp });
+      const h = iirRC(iirCR(single, p.tauCR * 1e-9, dt), p.tauRC * 1e-9, dt);
+      const hPk = Math.max(...Array.from(h).map(Math.abs));
+      const { edges: e } = discriminate(h, p.thr * hPk);
+      if (!e.length) return 0;
+      return sum(h, e[0], Math.min(N, e[0] + gateS)) * dt * 1e9;
+    })();
+
+    let Qnaive = 0;
+    for (const e of edges) Qnaive += sum(shaped_iir, e, Math.min(N, e + gateS)) * dt * 1e9;
+    let Qprot = 0;
+    for (const ev of accepted)
+      if (!ev.pile) Qprot += sum(shaped_iir, ev.start, Math.min(N, ev.gateEnd)) * dt * 1e9;
+
+    const re = Float64Array.from(input), im = new Float64Array(N);
+    fft(re, im, false);
+    const half = N / 2;
+    const magIn = new Float64Array(half), Hc = new Float64Array(half), Hl = new Float64Array(half);
+    const magHp = new Float64Array(half), magSh = new Float64Array(half);
+    let inMax = 1e-12;
+    for (let k = 0; k < half; k++) { magIn[k] = Math.hypot(re[k], im[k]); inMax = Math.max(inMax, magIn[k]); }
+    for (let k = 0; k < half; k++) {
+      const f = k / (N * dt), w = 2 * Math.PI * f;
+      const c = Hcr(w, p.tauCR * 1e-9), l = Hlp(w, p.tauRC * 1e-9);
+      Hc[k] = Math.hypot(c[0], c[1]); Hl[k] = Math.hypot(l[0], l[1]);
+      magIn[k] /= inMax;
+      magHp[k] = magIn[k] * Hc[k];
+      magSh[k] = magIn[k] * Hc[k] * Hl[k];
+    }
+
+    return {
+      scope: { input, hp_iir, shaped_iir, hp_fft, shaped_fft, over, gate, veto },
+      spec: { in: magIn, hp: magHp, shaped: magSh, Hcr: Hc, Hlp: Hl },
+      thr, pk, rms,
+      counts: { raw: edges.length, accepted: accepted.length, rejected, pileup },
+      Q: { ref: Qref, naive: Qnaive, prot: Qprot },
+      windowT: N * dt,
+    };
+  }, [p]);
+
+  useEffect(() => { fire(); }, [p.dbl, p.sep, p.tauCR, p.tauRC, p.amp, p.tf, p.tr, fire]);
+
+  const Qerr = R.Q.ref ? ((R.Q.naive - R.Q.ref) / R.Q.ref) * 100 : 0;
+
+  const panel: React.CSSProperties = {
+    background: T.card, border: `1px solid ${T.border}`, borderRadius: 12, boxShadow: T.shadow,
+  };
+
+  return (
+    <div
+      style={{
+        background: T.bg,
+        minHeight: "100%",
+        color: T.ink,
+        fontFamily: "'Noto Sans KR', system-ui, sans-serif",
+        padding: 14,
+      }}
+    >
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          marginBottom: 12,
+          flexWrap: "wrap",
+          gap: 8,
+        }}
+      >
+        <div>
+          <div
+            style={{
+              fontSize: 11,
+              letterSpacing: 3,
+              color: T.soft,
+              textTransform: "uppercase",
+              fontFamily: "'IBM Plex Mono', monospace",
+            }}
+          >
+            Signal Processing Chain
+          </div>
+          <div style={{ fontSize: 20, letterSpacing: 1, fontWeight: 600, fontFamily: "'Sora', 'Noto Sans KR', sans-serif" }}>
+            Pulse → <span style={{ color: T.cyan }}>HPF</span> →{" "}
+            <span style={{ color: C.ch4 }}>LPF</span> → Discriminator →{" "}
+            <span style={{ color: C.veto }}>Veto</span>
+          </div>
+        </div>
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          <div className="seg" style={{ width: 168 }}>
+            <button className={!p.dbl ? "on" : ""} onClick={() => set("dbl")(false)}>SINGLE</button>
+            <button className={p.dbl ? "on" : ""} onClick={() => set("dbl")(true)}>DOUBLE</button>
+          </div>
+          <button
+            onClick={fire}
+            style={{
+              background: C.warn, color: "#1a0b08", border: 0, borderRadius: 6,
+              padding: "8px 16px", fontWeight: 700, letterSpacing: 1, cursor: "pointer",
+            }}
+          >
+            FIRE
+          </button>
+        </div>
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "minmax(0,1fr) 260px", gap: 12, alignItems: "start" }}>
+        {/* LEFT: scopes + stats */}
+        <div style={{ display: "grid", gridTemplateColumns: "minmax(0,1fr)", gap: 12 }}>
+          <div style={{ ...panel, padding: 8 }}>
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                padding: "2px 4px 8px",
+                fontSize: 10,
+                color: T.soft,
+                letterSpacing: 1,
+                fontFamily: "'IBM Plex Mono', monospace",
+              }}
+            >
+              <span>TIME DOMAIN · {(R.windowT * 1e6).toFixed(2)} µs · fs = 1 GHz</span>
+              <label
+                style={{
+                  display: "flex",
+                  gap: 5,
+                  alignItems: "center",
+                  cursor: "pointer",
+                  color: p.fftPath ? T.ink : T.soft,
+                }}
+              >
+                <input
+                  type="checkbox"
+                  checked={p.fftPath}
+                  onChange={(e) => set("fftPath")(e.target.checked)}
+                />
+                FFT path overlay (dotted)
+              </label>
+            </div>
+            <div style={{ height: 320, background: C.screen, borderRadius: 5 }}>
+              <Scope
+                data={R.scope}
+                dt={dt}
+                threshold={R.thr}
+                sweep={sweep}
+                showFFTpath={p.fftPath}
+              />
+            </div>
+          </div>
+
+          <div style={{ ...panel, padding: 8 }}>
+            <div
+              style={{
+                padding: "2px 4px 8px",
+                fontSize: 10,
+                color: T.soft,
+                letterSpacing: 1,
+                fontFamily: "'IBM Plex Mono', monospace",
+              }}
+            >
+              FREQUENCY DOMAIN · |X(f)| with filter |H(f)| overlay
+            </div>
+            <div style={{ height: 160, background: C.screen, borderRadius: 5 }}>
+              <Spectrum spec={R.spec} dt={dt} />
+            </div>
+          </div>
+
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: "repeat(auto-fit,minmax(110px,1fr))",
+              gap: 8,
+            }}
+          >
+            <Stat label="Triggers (raw)" value={R.counts.raw} />
+            <Stat label="Accepted" value={R.counts.accepted} color={C.ch4} />
+            <Stat
+              label="Rejected (veto)"
+              value={R.counts.rejected}
+              color={C.veto}
+              sub={R.counts.pileup ? `${R.counts.pileup} pile-up` : ""}
+            />
+            <Stat
+              label="Path agreement"
+              value={(R.rms * 100).toExponential(1) + "%"}
+              color={C.ch2}
+              sub="IIR vs FFT, RMS"
+            />
+            <Stat label="Q reference" value={R.Q.ref.toFixed(1)} color={C.dim} sub="single pulse, a.u.·ns" />
+            <Stat
+              label="Q naive (no veto)"
+              value={R.Q.naive.toFixed(1)}
+              color={Math.abs(Qerr) > 5 ? C.warn : C.ink}
+              sub={`${Qerr >= 0 ? "+" : ""}${Qerr.toFixed(0)}% vs ref`}
+            />
+            <Stat label="Q protected" value={R.Q.prot.toFixed(1)} color={C.ch4} sub="veto + pile-up reject" />
+          </div>
+        </div>
+
+        {/* RIGHT: controls */}
+        <div style={{ display: "grid", gridTemplateColumns: "minmax(0,1fr)", gap: 12 }}>
+          <div style={{ ...panel, padding: 12 }}>
+            <div style={{ fontSize: 10, letterSpacing: 1.5, color: C.ch1, marginBottom: 10, fontFamily: "'IBM Plex Mono', monospace" }}>
+              ● PULSE
+            </div>
+            <Fader label="amplitude" value={p.amp} min={0.2} max={2} step={0.05} onChange={set("amp") as (v: number) => void} fmt={(v) => v.toFixed(2)} color={C.ch1} />
+            <Fader label="rise τ" value={p.tr} min={2} max={60} step={1} onChange={set("tr") as (v: number) => void} fmt={(v) => v + " ns"} color={C.ch1} />
+            <Fader label="fall τ" value={p.tf} min={30} max={400} step={5} onChange={set("tf") as (v: number) => void} fmt={(v) => v + " ns"} color={C.ch1} />
+            {p.dbl && (
+              <Fader
+                label="2nd-pulse separation"
+                value={p.sep}
+                min={20}
+                max={1500}
+                step={10}
+                onChange={set("sep") as (v: number) => void}
+                fmt={(v) => v + " ns"}
+                color={C.ch3}
+              />
+            )}
+          </div>
+          <div style={{ ...panel, padding: 12 }}>
+            <div style={{ fontSize: 10, letterSpacing: 1.5, color: T.cyan, marginBottom: 10, fontFamily: "'IBM Plex Mono', monospace" }}>
+              ● SHAPING (CR-RC)
+            </div>
+            <Fader label="HPF  τ_CR" value={p.tauCR} min={20} max={600} step={5} onChange={set("tauCR") as (v: number) => void} fmt={(v) => v + " ns"} color={T.cyan} />
+            <Fader label="LPF  τ_RC" value={p.tauRC} min={10} max={300} step={5} onChange={set("tauRC") as (v: number) => void} fmt={(v) => v + " ns"} color={C.ch4} />
+            <Fader
+              label="discriminator threshold"
+              value={p.thr}
+              min={0.05}
+              max={0.9}
+              step={0.01}
+              onChange={set("thr") as (v: number) => void}
+              fmt={(v) => (v * 100).toFixed(0) + "% pk"}
+              color={C.warn}
+            />
+          </div>
+          <div style={{ ...panel, padding: 12 }}>
+            <div style={{ fontSize: 10, letterSpacing: 1.5, color: C.veto, marginBottom: 10, fontFamily: "'IBM Plex Mono', monospace" }}>
+              ● DUAL TIMER / VETO
+            </div>
+            <Fader label="timer 1 · gate width" value={p.gate} min={50} max={1200} step={10} onChange={set("gate") as (v: number) => void} fmt={(v) => v + " ns"} color={C.gate} />
+            <Fader
+              label="timer 2 · veto (dead time)"
+              value={p.veto}
+              min={50}
+              max={2000}
+              step={10}
+              onChange={set("veto") as (v: number) => void}
+              fmt={(v) => v + " ns"}
+              color={C.veto}
+            />
+            <div style={{ fontSize: 10, color: T.soft, lineHeight: 1.5, marginTop: 6, fontFamily: "'IBM Plex Mono', monospace" }}>
+              In <b style={{ color: T.ink }}>DOUBLE</b> mode, bring the two pulses within the
+              veto window and watch <b style={{ color: C.warn }}>Q naive</b> inflate while{" "}
+              <b style={{ color: C.ch4 }}>Q protected</b> stays clean.
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* =========================================================================
+   ACQUISITION TAB  —  streaming MCA
+   ========================================================================= */
+function gaussAcq(): number {
+  let u = 0, v = 0;
+  while (!u) u = Math.random();
+  while (!v) v = Math.random();
+  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+}
+
+function RangeFader({
+  label,
+  lo,
+  hi,
+  min,
+  max,
+  step,
+  onLo,
+  onHi,
+  color,
+}: {
+  label: string;
+  lo: number;
+  hi: number;
+  min: number;
+  max: number;
+  step: number;
+  onLo: (v: number) => void;
+  onHi: (v: number) => void;
+  color: string;
+}) {
+  return (
+    <div style={{ marginBottom: 11 }}>
+      <div
+        style={{
+          display: "flex",
+          justifyContent: "space-between",
+          fontSize: 10,
+          letterSpacing: 0.5,
+          marginBottom: 3,
+        }}
+      >
+        <span style={{ color: C.label }}>{label}</span>
+        <span style={{ color, fontFamily: "ui-monospace, monospace" }}>
+          {lo.toFixed(2)} – {hi.toFixed(2)}
+        </span>
+      </div>
+      <input
+        className="fdr"
+        type="range"
+        min={min}
+        max={max}
+        step={step}
+        value={lo}
+        onChange={(e) => onLo(Math.min(parseFloat(e.target.value), hi - step))}
+        style={{ accentColor: color, marginBottom: 4 }}
+      />
+      <input
+        className="fdr"
+        type="range"
+        min={min}
+        max={max}
+        step={step}
+        value={hi}
+        onChange={(e) => onHi(Math.max(parseFloat(e.target.value), lo + step))}
+        style={{ accentColor: color }}
+      />
+    </div>
+  );
+}
+
+interface EventRecord {
+  t: number;
+  A: number;
+  ic: number;
+  accepted: boolean;
+  piled: boolean;
+  done: boolean;
+}
+
+interface AcqCounts {
+  total: number;
+  acc: number;
+  rej: number;
+  pile: number;
+  sub: number;
+}
+
+interface AcqState {
+  sU: Float64Array;
+  evt: EventRecord[];
+  simTime: number;
+  nextT: number;
+  vetoEnd: number;
+  gateEnd: number;
+  curIdx: number;
+  lastTrigT: number | null;
+  histProt: Float64Array;
+  histNaive: Float64Array;
+  counts: AcqCounts;
+  finPtr: number;
+}
+
+function LiveScope({
+  stateRef,
+  sceneWinNs,
+  thrFrac,
+  pkU,
+  dtR,
+  ampHi,
+  gateNs,
+  vetoNs,
+  mode,
+}: {
+  stateRef: React.RefObject<AcqState>;
+  sceneWinNs: number;
+  thrFrac: number;
+  pkU: number;
+  dtR: number;
+  ampHi: number;
+  gateNs: number;
+  vetoNs: number;
+  mode: string;
+}) {
+  const ref = useRef<HTMLCanvasElement>(null);
+  useEffect(() => {
+    let raf: number;
+    const TRIG_F = 0.34;
+    const draw = () => {
+      const cv = ref.current;
+      if (!cv) { raf = requestAnimationFrame(draw); return; }
+      const dpr = window.devicePixelRatio || 1, W = cv.clientWidth, H = cv.clientHeight;
+      cv.width = W * dpr; cv.height = H * dpr;
+      const g = cv.getContext("2d")!; g.setTransform(dpr, 0, 0, dpr, 0, 0);
+      g.clearRect(0, 0, W, H);
+      const S = stateRef.current!;
+      const sU = S.sU;
+      const padL = 8, padR = 8, padT = 8, padB = 8;
+      const pw = W - padL - padR, ph = H - padT - padB;
+      const winT = sceneWinNs * 1e-9, Lr = sU.length * dtR;
+
+      const trig = mode === "trig" && S.lastTrigT != null;
+      const t0 = trig ? S.lastTrigT! - TRIG_F * winT : S.simTime - winT;
+      const t1 = t0 + winT;
+      const tToX = (t: number) => padL + ((t - t0) / winT) * pw;
+      const xClamp = (x: number) => Math.max(padL, Math.min(padL + pw, x));
+
+      const mx = Math.max(thrFrac * pkU * 1.5, ampHi * pkU * 1.18);
+      const baseY = padT + ph * 0.84;
+      const yAt = (v: number) => baseY - (v / mx) * ph * 0.74;
+      const yThr = yAt(thrFrac * pkU);
+
+      if (trig) {
+        const xg0 = tToX(S.lastTrigT!);
+        g.fillStyle = "rgba(255,77,77,0.10)";
+        g.fillRect(xClamp(xg0), padT, xClamp(tToX(S.lastTrigT! + vetoNs * 1e-9)) - xClamp(xg0), ph);
+        g.fillStyle = "rgba(122,217,107,0.13)";
+        g.fillRect(xClamp(xg0), padT, xClamp(tToX(S.lastTrigT! + gateNs * 1e-9)) - xClamp(xg0), ph);
+        g.fillStyle = "rgba(122,217,107,0.7)"; g.font = "8px ui-monospace, monospace"; g.textAlign = "left";
+        g.fillText("gate", xClamp(xg0) + 3, padT + ph - 4);
+        g.fillStyle = "rgba(255,77,77,0.7)";
+        g.fillText("veto", xClamp(tToX(S.lastTrigT! + gateNs * 1e-9)) + 3, padT + ph - 4);
+      }
+
+      const M = Math.max(64, Math.floor(pw));
+      const ys = new Float64Array(M);
+      for (const e of S.evt) {
+        if (e.t > t1 || e.t + Lr < t0) continue;
+        for (let i = 0; i < M; i++) {
+          const t = t0 + (i / (M - 1)) * winT, u = (t - e.t) / dtR;
+          if (u < 0 || u >= sU.length - 1) continue;
+          const k = u | 0;
+          ys[i] += e.A * (sU[k] + (sU[k + 1] - sU[k]) * (u - k));
+        }
+      }
+
+      g.strokeStyle = "rgba(255,107,94,0.6)"; g.setLineDash([5, 4]); g.lineWidth = 1;
+      g.beginPath(); g.moveTo(padL, yThr); g.lineTo(padL + pw, yThr); g.stroke(); g.setLineDash([]);
+      g.fillStyle = "rgba(255,107,94,0.85)"; g.font = "8px ui-monospace, monospace"; g.textAlign = "left";
+      g.fillText("thr " + (thrFrac * 100).toFixed(0) + "%", padL + 2, yThr - 3);
+
+      if (trig) {
+        const xt = tToX(S.lastTrigT!);
+        g.strokeStyle = "rgba(201,212,224,0.55)"; g.setLineDash([2, 3]); g.lineWidth = 1;
+        g.beginPath(); g.moveTo(xt, padT); g.lineTo(xt, padT + ph); g.stroke(); g.setLineDash([]);
+        g.fillStyle = C.ink; g.textAlign = "center"; g.font = "8px ui-monospace, monospace";
+        g.fillText("TRIG", xt, padT + 8);
+        g.fillStyle = C.ch4; g.beginPath(); g.arc(xt, yThr, 2.6, 0, 7); g.fill();
+      }
+
+      g.strokeStyle = C.ch4; g.lineWidth = 1.3; g.shadowColor = C.ch4; g.shadowBlur = 5;
+      g.beginPath();
+      for (let i = 0; i < M; i++) {
+        const x = padL + (i / (M - 1)) * pw, y = yAt(ys[i]);
+        i ? g.lineTo(x, y) : g.moveTo(x, y);
+      }
+      g.stroke(); g.shadowBlur = 0;
+
+      for (const e of S.evt) {
+        if (e.t < t0 || e.t > t1) continue;
+        const x = tToX(e.t);
+        g.strokeStyle = e.accepted ? C.ch4 : C.veto; g.lineWidth = 1;
+        g.beginPath(); g.moveTo(x, baseY + 4); g.lineTo(x, baseY + 9); g.stroke();
+      }
+      g.fillStyle = C.dim; g.font = "9px ui-monospace, monospace"; g.textAlign = "right";
+      g.fillText(`${trig ? "TRIG" : "ROLL"} · ${(winT * 1e6).toFixed(1)} µs`, padL + pw, padT + 9);
+      raf = requestAnimationFrame(draw);
+    };
+    raf = requestAnimationFrame(draw);
+    return () => cancelAnimationFrame(raf);
+  }, [stateRef, sceneWinNs, thrFrac, pkU, dtR, ampHi, gateNs, vetoNs, mode]);
+  return <canvas ref={ref} style={{ width: "100%", height: "100%", display: "block" }} />;
+}
+
+function Histogram({
+  stateRef,
+  mode,
+  chargeMax,
+  ampLines,
+}: {
+  stateRef: React.RefObject<AcqState>;
+  mode: string;
+  chargeMax: number;
+  ampLines: number[] | null;
+}) {
+  const ref = useRef<HTMLCanvasElement>(null);
+  useEffect(() => {
+    let raf: number;
+    const draw = () => {
+      const cv = ref.current;
+      if (!cv) { raf = requestAnimationFrame(draw); return; }
+      const dpr = window.devicePixelRatio || 1, W = cv.clientWidth, H = cv.clientHeight;
+      cv.width = W * dpr; cv.height = H * dpr;
+      const g = cv.getContext("2d")!; g.setTransform(dpr, 0, 0, dpr, 0, 0);
+      g.clearRect(0, 0, W, H);
+      const S = stateRef.current!;
+      const hist = mode === "naive" ? S.histNaive : S.histProt;
+      const bins = hist.length;
+      const padL = 40, padR = 8, padT = 10, padB = 18;
+      const pw = W - padL - padR, ph = H - padT - padB;
+      let mx = 1; for (let i = 0; i < bins; i++) mx = Math.max(mx, hist[i]);
+      const color = mode === "naive" ? C.warn : C.ch4;
+      g.strokeStyle = C.grid; g.lineWidth = 1; g.font = "8px ui-monospace, monospace";
+      g.fillStyle = C.dim; g.textAlign = "right";
+      for (let i = 0; i <= 4; i++) {
+        const y = padT + (i / 4) * ph, v = Math.round(mx * (1 - i / 4));
+        g.beginPath(); g.moveTo(padL, y); g.lineTo(padL + pw, y); g.stroke();
+        g.fillText(String(v), padL - 3, y + 3);
+      }
+      g.textAlign = "center";
+      for (let i = 0; i <= 4; i++) {
+        const x = padL + (i / 4) * pw, q = (i / 4) * chargeMax;
+        g.fillText(q.toFixed(0), x, H - 5);
+      }
+      if (ampLines)
+        for (const q of ampLines) {
+          const x = padL + (q / chargeMax) * pw;
+          g.strokeStyle = "rgba(63,208,216,0.35)"; g.setLineDash([3, 3]); g.lineWidth = 1;
+          g.beginPath(); g.moveTo(x, padT); g.lineTo(x, padT + ph); g.stroke(); g.setLineDash([]);
+        }
+      g.fillStyle = color; g.shadowColor = color; g.shadowBlur = 4;
+      const bw = pw / bins;
+      for (let i = 0; i < bins; i++) {
+        const h = (hist[i] / mx) * ph;
+        if (h > 0) g.fillRect(padL + i * bw, padT + ph - h, Math.max(1, bw - 0.3), h);
+      }
+      g.shadowBlur = 0;
+      g.fillStyle = color; g.font = "9px ui-monospace, monospace"; g.textAlign = "left";
+      g.fillText(
+        `${mode === "naive" ? "NAIVE (no pile-up reject)" : "PROTECTED"} · channel = charge (a.u.·ns)`,
+        padL + 4, padT + 9
+      );
+      raf = requestAnimationFrame(draw);
+    };
+    raf = requestAnimationFrame(draw);
+    return () => cancelAnimationFrame(raf);
+  }, [stateRef, mode, chargeMax, ampLines]);
+  return <canvas ref={ref} style={{ width: "100%", height: "100%", display: "block" }} />;
+}
+
+interface AcqParams {
+  rate: number;
+  speed: number;
+  running: boolean;
+  ampLo: number;
+  ampHi: number;
+  dist: string;
+  noise: number;
+  tauCR: number;
+  tauRC: number;
+  gate: number;
+  veto: number;
+  thr: number;
+  mode: string;
+  scopeMode: string;
+}
+
+function AcquisitionTab() {
+  const dtR = 1e-9;
+  const BINS = 240;
+  const [q, setQ] = useState<AcqParams>({
+    rate: 5e4, speed: 1, running: true,
+    ampLo: 0.2, ampHi: 1.6, dist: "uniform", noise: 0.04,
+    tauCR: 200, tauRC: 50, gate: 300, veto: 600, thr: 0.30,
+    mode: "protected", scopeMode: "trig",
+  });
+  const setk = (k: keyof AcqParams) => (v: AcqParams[keyof AcqParams]) =>
+    setQ((s) => ({ ...s, [k]: v }));
+  const [, force] = useState(0);
+
+  const resp = useMemo(() => {
+    const tauCR = q.tauCR * 1e-9, tauRC = q.tauRC * 1e-9;
+    const Lns = q.gate + 6 * Math.max(q.tauCR, q.tauRC, 100) + 200;
+    const Lr = Math.min(8192, Math.ceil(Lns));
+    const inp = makePulse(Lr, dtR, { t0: 0, tr: 10e-9, tf: 100e-9, amp: 1 });
+    const sU = iirRC(iirCR(inp, tauCR, dtR), tauRC, dtR);
+    let pkU = 0; for (let i = 0; i < Lr; i++) pkU = Math.max(pkU, sU[i]);
+    const CU = new Float64Array(Lr + 1);
+    for (let i = 0; i < Lr; i++) CU[i + 1] = CU[i] + sU[i] * dtR * 1e9;
+    return { sU, pkU, CU, Lr };
+  }, [q.tauCR, q.tauRC, q.gate]);
+
+  const stateRef = useRef<AcqState | null>(null);
+  if (!stateRef.current) {
+    stateRef.current = {
+      sU: resp.sU, evt: [], simTime: 0, nextT: 0,
+      vetoEnd: -1, gateEnd: -1, curIdx: -1, lastTrigT: null,
+      histProt: new Float64Array(BINS), histNaive: new Float64Array(BINS),
+      counts: { total: 0, acc: 0, rej: 0, pile: 0, sub: 0 }, finPtr: 0,
+    };
+  }
+  stateRef.current.sU = resp.sU;
+
+  const gateS = Math.round(q.gate);
+  const crossIdx = useCallback((A: number): number => {
+    const { sU, pkU } = resp; const th = q.thr * pkU;
+    for (let i = 1; i < sU.length; i++)
+      if (A * sU[i] >= th && A * sU[i - 1] < th) return i;
+    return -1;
+  }, [resp, q.thr]);
+
+  const eventCharge = useCallback((A: number, idx: number): number => {
+    const S = stateRef.current!; const { CU, Lr } = resp;
+    const ev = S.evt[idx]; if (!ev) return 0;
+    const ic = ev.ic; if (ic < 0) return 0;
+    const gStart = ev.t + ic * dtR, gEnd = gStart + gateS * dtR;
+    let Q = 0;
+    for (let j = Math.max(0, idx - 40); j < S.evt.length; j++) {
+      const e2 = S.evt[j]; const d = e2.t;
+      let u1 = (gStart - d) / dtR, u2 = (gEnd - d) / dtR;
+      if (u2 <= 0 || u1 >= Lr) continue;
+      u1 = Math.max(0, u1); u2 = Math.min(Lr, u2);
+      Q += e2.A * (CU[Math.round(u2)] - CU[Math.round(u1)]);
+    }
+    return Q;
+  }, [resp, gateS]);
+
+  const Gunit = useMemo(() => {
+    const { CU } = resp; const ic = crossIdx(1); if (ic < 0) return 0;
+    return CU[Math.min(CU.length - 1, ic + gateS)] - CU[ic];
+  }, [resp, crossIdx, gateS]);
+  const chargeMax = Math.max(1, q.ampHi * Gunit * 2.2);
+
+  const clearAcq = useCallback(() => {
+    const S = stateRef.current!;
+    S.evt = []; S.simTime = 0; S.nextT = 0;
+    S.vetoEnd = -1; S.gateEnd = -1; S.curIdx = -1; S.finPtr = 0; S.lastTrigT = null;
+    S.histProt = new Float64Array(BINS); S.histNaive = new Float64Array(BINS);
+    S.counts = { total: 0, acc: 0, rej: 0, pile: 0, sub: 0 };
+  }, []);
+  useEffect(() => { clearAcq(); }, [q.tauCR, q.tauRC, q.gate, q.thr, q.ampLo, q.ampHi, q.dist, q.noise, clearAcq]);
+
+  const sampleAmp = useCallback((): number => {
+    if (q.dist === "lines") {
+      const span = q.ampHi - q.ampLo;
+      const centers = [q.ampLo + span * 0.45, q.ampLo + span * 0.82];
+      const c = centers[Math.random() < 0.6 ? 0 : 1];
+      const a = c + gaussAcq() * span * 0.035;
+      return Math.max(q.ampLo, Math.min(q.ampHi, a));
+    }
+    return q.ampLo + Math.random() * (q.ampHi - q.ampLo);
+  }, [q.dist, q.ampLo, q.ampHi]);
+
+  useEffect(() => {
+    if (!q.running) return;
+    let raf: number, last = performance.now();
+    const tick = (now: number) => {
+      const S = stateRef.current!;
+      const frameDt = Math.min(0.05, (now - last) / 1000); last = now;
+      let dExp = q.speed * frameDt;
+      const rate = q.rate, vetoT = q.veto * 1e-9;
+      const tEnd = S.simTime + dExp;
+      let made = 0, capped = false;
+      while (S.nextT < tEnd) {
+        if (made >= 6000) { capped = true; break; }
+        const t = S.nextT;
+        const A = sampleAmp();
+        const idx = S.evt.length;
+        const ic = crossIdx(A);
+        const ev: EventRecord = { t, A, ic, accepted: false, piled: false, done: false };
+        S.evt.push(ev);
+        if (ic < 0) { S.counts.sub++; }
+        else if (t < S.vetoEnd) {
+          S.counts.rej++;
+          if (t < S.gateEnd && S.curIdx >= 0 && !S.evt[S.curIdx].piled) {
+            S.evt[S.curIdx].piled = true; S.counts.pile++;
+          }
+        } else {
+          ev.accepted = true; S.counts.total++; S.counts.acc++;
+          S.gateEnd = t + (ic + gateS) * dtR;
+          S.vetoEnd = t + vetoT;
+          S.curIdx = idx;
+          S.lastTrigT = t + ic * dtR;
+        }
+        made++;
+        S.nextT += -Math.log(1 - Math.random()) / rate;
+      }
+      S.simTime = capped ? S.nextT : tEnd;
+      const guard = resp.Lr * dtR;
+      while (S.finPtr < S.evt.length) {
+        const e = S.evt[S.finPtr];
+        if (e.t + (e.ic + gateS) * dtR > S.simTime - guard) break;
+        if (e.accepted && !e.done) {
+          let Qc = eventCharge(e.A, S.finPtr) + gaussAcq() * q.noise * Gunit;
+          const bin = Math.max(0, Math.min(BINS - 1, Math.floor((Qc / chargeMax) * BINS)));
+          S.histNaive[bin]++;
+          if (!e.piled) S.histProt[bin]++;
+          e.done = true;
+        }
+        S.finPtr++;
+      }
+      const keepFrom = S.simTime - (guard + 6e-6);
+      if (S.finPtr > 200) {
+        let drop = 0;
+        while (drop < S.finPtr && S.evt[drop].t < keepFrom) drop++;
+        if (drop > 0) {
+          S.evt.splice(0, drop); S.finPtr -= drop;
+          if (S.curIdx >= 0) S.curIdx -= drop;
+        }
+      }
+      force((x) => x + 1);
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [q.running, q.speed, q.rate, q.veto, q.noise, sampleAmp, crossIdx, eventCharge, Gunit, chargeMax, gateS, resp.Lr]);
+
+  const randomize = () =>
+    setQ((s) => ({
+      ...s,
+      rate: Math.round(Math.pow(10, 3 + Math.random() * 2.7)),
+      tauCR: 20 + Math.round(Math.random() * 580),
+      tauRC: 10 + Math.round(Math.random() * 290),
+      gate: 50 + Math.round(Math.random() * 700),
+      veto: 50 + Math.round(Math.random() * 1500),
+      thr: +(0.08 + Math.random() * 0.5).toFixed(2),
+      noise: +(Math.random() * 0.12).toFixed(3),
+    }));
+
+  const S = stateRef.current!;
+  const lr = S.simTime > 0 ? S.counts.acc / S.simTime : 0;
+  const dead = S.simTime > 0
+    ? Math.min(100, 100 * S.counts.acc * q.veto * 1e-9 / S.simTime)
+    : 0;
+  const thru =
+    S.counts.total + S.counts.rej + S.counts.sub > 0
+      ? 100 * S.counts.acc / (S.counts.total + S.counts.rej)
+      : 0;
+  const ampLines =
+    q.dist === "lines"
+      ? [
+          (q.ampLo + (q.ampHi - q.ampLo) * 0.45) * Gunit,
+          (q.ampLo + (q.ampHi - q.ampLo) * 0.82) * Gunit,
+        ]
+      : null;
+  const panel: React.CSSProperties = {
+    background: T.card, border: `1px solid ${T.border}`, borderRadius: 12, boxShadow: T.shadow,
+  };
+
+  return (
+    <div style={{ color: T.ink, fontFamily: "'Noto Sans KR', system-ui, sans-serif", padding: 14 }}>
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          marginBottom: 12,
+          flexWrap: "wrap",
+          gap: 8,
+        }}
+      >
+        <div>
+          <div style={{ fontSize: 11, letterSpacing: 3, color: T.soft, textTransform: "uppercase", fontFamily: "'IBM Plex Mono', monospace" }}>
+            Multichannel Acquisition
+          </div>
+          <div style={{ fontSize: 20, letterSpacing: 1, fontWeight: 600, fontFamily: "'Sora', 'Noto Sans KR', sans-serif" }}>
+            Live pulse-height spectrum
+          </div>
+        </div>
+        <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+          <button
+            onClick={() => setk("running")(!q.running)}
+            style={{
+              background: q.running ? T.card2 : C.ch4,
+              color: q.running ? T.ink : "#06140a",
+              border: `1px solid ${T.border}`, borderRadius: 6, padding: "8px 16px",
+              fontWeight: 700, letterSpacing: 1, cursor: "pointer",
+              fontFamily: "'IBM Plex Mono', monospace",
+            }}
+          >
+            {q.running ? "❚❚ PAUSE" : "▶ RUN"}
+          </button>
+          <button
+            onClick={clearAcq}
+            style={{
+              background: "transparent", color: T.soft, border: `1px solid ${T.border}`,
+              borderRadius: 6, padding: "8px 14px", cursor: "pointer",
+              fontFamily: "'IBM Plex Mono', monospace",
+            }}
+          >
+            CLEAR
+          </button>
+          <button
+            onClick={randomize}
+            style={{
+              background: "transparent", color: C.ch1, border: `1px solid ${T.border}`,
+              borderRadius: 6, padding: "8px 14px", cursor: "pointer",
+              fontFamily: "'IBM Plex Mono', monospace",
+            }}
+          >
+            🎲 RANDOMIZE
+          </button>
+        </div>
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "minmax(0,1fr)", gap: 12 }}>
+        <div style={{ ...panel, padding: 8 }}>
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "center",
+              padding: "2px 4px 8px",
+              fontSize: 10,
+              color: T.soft,
+              letterSpacing: 1,
+              fontFamily: "'IBM Plex Mono', monospace",
+            }}
+          >
+            <span>DETECTOR STREAM · shaped output</span>
+            <span className="seg" style={{ width: 150 }}>
+              <button
+                className={q.scopeMode === "trig" ? "on" : ""}
+                onClick={() => setk("scopeMode")("trig")}
+              >
+                TRIG
+              </button>
+              <button
+                className={q.scopeMode === "roll" ? "on" : ""}
+                onClick={() => setk("scopeMode")("roll")}
+              >
+                ROLL
+              </button>
+            </span>
+          </div>
+          <div style={{ height: 150, background: C.screen, borderRadius: 5 }}>
+            <LiveScope
+              stateRef={stateRef as React.RefObject<AcqState>}
+              sceneWinNs={2200}
+              thrFrac={q.thr}
+              pkU={resp.pkU}
+              dtR={dtR}
+              ampHi={q.ampHi}
+              gateNs={q.gate}
+              vetoNs={q.veto}
+              mode={q.scopeMode}
+            />
+          </div>
+        </div>
+
+        <div style={{ ...panel, padding: 8 }}>
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "space-between",
+              padding: "2px 4px 8px",
+              fontSize: 10,
+              color: T.soft,
+              letterSpacing: 1,
+              fontFamily: "'IBM Plex Mono', monospace",
+            }}
+          >
+            <span>PULSE-HEIGHT HISTOGRAM</span>
+            <span className="seg" style={{ width: 220 }}>
+              <button
+                className={q.mode === "protected" ? "on" : ""}
+                onClick={() => setk("mode")("protected")}
+              >
+                PROTECTED
+              </button>
+              <button
+                className={q.mode === "naive" ? "on" : ""}
+                onClick={() => setk("mode")("naive")}
+              >
+                NAIVE
+              </button>
+            </span>
+          </div>
+          <div style={{ height: 240, background: C.screen, borderRadius: 5 }}>
+            <Histogram
+              stateRef={stateRef as React.RefObject<AcqState>}
+              mode={q.mode}
+              chargeMax={chargeMax}
+              ampLines={ampLines}
+            />
+          </div>
+        </div>
+
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(110px,1fr))", gap: 8 }}>
+          <Stat
+            label="Elapsed (sim)"
+            value={
+              S.simTime < 1e-3
+                ? (S.simTime * 1e6).toFixed(0) + " µs"
+                : (S.simTime * 1e3).toFixed(1) + " ms"
+            }
+          />
+          <Stat label="Counts" value={S.counts.acc} color={C.ch4} />
+          <Stat
+            label="Output rate"
+            value={lr >= 1e3 ? (lr / 1e3).toFixed(1) + "k/s" : lr.toFixed(0) + "/s"}
+            color={C.ch2}
+          />
+          <Stat
+            label="Rejected"
+            value={S.counts.rej}
+            color={C.veto}
+            sub={`${S.counts.pile} pile-up`}
+          />
+          <Stat label="Sub-threshold" value={S.counts.sub} color={C.dim} />
+          <Stat
+            label="Dead time"
+            value={dead.toFixed(0) + "%"}
+            color={dead > 30 ? C.warn : C.ink}
+          />
+          <Stat
+            label="Throughput"
+            value={thru.toFixed(0) + "%"}
+            color={thru < 70 ? C.warn : C.ch4}
+            sub="acc / triggers"
+          />
+        </div>
+
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(220px,1fr))", gap: 12 }}>
+          <div style={{ ...panel, padding: 12 }}>
+            <div style={{ fontSize: 10, letterSpacing: 1.5, color: C.ch1, marginBottom: 10, fontFamily: "'IBM Plex Mono', monospace" }}>
+              ● SOURCE
+            </div>
+            <Fader
+              label="event rate"
+              value={q.rate}
+              min={3}
+              max={5.7}
+              step={0.05}
+              onChange={(v) => setk("rate")(Math.round(Math.pow(10, v)))}
+              fmt={() => (q.rate >= 1e3 ? (q.rate / 1e3).toFixed(1) + "k/s" : q.rate + "/s")}
+              color={C.ch1}
+            />
+            <RangeFader
+              label="amplitude range"
+              lo={q.ampLo}
+              hi={q.ampHi}
+              min={0.05}
+              max={2}
+              step={0.05}
+              onLo={setk("ampLo") as (v: number) => void}
+              onHi={setk("ampHi") as (v: number) => void}
+              color={C.ch1}
+            />
+            <div className="seg" style={{ marginBottom: 10 }}>
+              <button
+                className={q.dist === "uniform" ? "on" : ""}
+                onClick={() => setk("dist")("uniform")}
+              >
+                UNIFORM
+              </button>
+              <button
+                className={q.dist === "lines" ? "on" : ""}
+                onClick={() => setk("dist")("lines")}
+              >
+                LINES
+              </button>
+            </div>
+            <Fader
+              label="electronic noise σ"
+              value={q.noise}
+              min={0}
+              max={0.15}
+              step={0.005}
+              onChange={setk("noise") as (v: number) => void}
+              fmt={(v) => (v * 100).toFixed(1) + "%"}
+              color={C.ch3}
+            />
+          </div>
+          <div style={{ ...panel, padding: 12 }}>
+            <div style={{ fontSize: 10, letterSpacing: 1.5, color: T.cyan, marginBottom: 10, fontFamily: "'IBM Plex Mono', monospace" }}>
+              ● SHAPING + TRIGGER
+            </div>
+            <Fader label="HPF  τ_CR" value={q.tauCR} min={20} max={600} step={5} onChange={setk("tauCR") as (v: number) => void} fmt={(v) => v + " ns"} color={T.cyan} />
+            <Fader label="LPF  τ_RC" value={q.tauRC} min={10} max={300} step={5} onChange={setk("tauRC") as (v: number) => void} fmt={(v) => v + " ns"} color={C.ch4} />
+            <Fader
+              label="threshold"
+              value={q.thr}
+              min={0.05}
+              max={0.7}
+              step={0.01}
+              onChange={setk("thr") as (v: number) => void}
+              fmt={(v) => (v * 100).toFixed(0) + "% pk"}
+              color={C.warn}
+            />
+          </div>
+          <div style={{ ...panel, padding: 12 }}>
+            <div style={{ fontSize: 10, letterSpacing: 1.5, color: C.veto, marginBottom: 10, fontFamily: "'IBM Plex Mono', monospace" }}>
+              ● TIMING + DISPLAY
+            </div>
+            <Fader label="gate width" value={q.gate} min={50} max={1200} step={10} onChange={setk("gate") as (v: number) => void} fmt={(v) => v + " ns"} color={C.gate} />
+            <Fader label="veto (dead time)" value={q.veto} min={50} max={2000} step={10} onChange={setk("veto") as (v: number) => void} fmt={(v) => v + " ns"} color={C.veto} />
+            <Fader
+              label="sim speed"
+              value={Math.log10(q.speed)}
+              min={-1}
+              max={1.3}
+              step={0.05}
+              onChange={(v) => setk("speed")(+Math.pow(10, v).toFixed(2))}
+              fmt={() => q.speed + "×"}
+              color={T.ink}
+            />
+            <div style={{ fontSize: 10, color: T.soft, lineHeight: 1.5, marginTop: 4, fontFamily: "'IBM Plex Mono', monospace" }}>
+              Push <b style={{ color: T.ink }}>rate</b> up and switch{" "}
+              <b style={{ color: C.warn }}>NAIVE</b> ↔{" "}
+              <b style={{ color: C.ch4 }}>PROTECTED</b>: pile-up smears the naive spectrum toward
+              higher channels while protected stays sharp.
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* =========================================================================
+   APP SHELL  —  tab switch
+   ========================================================================= */
+export default function PulseChain() {
+  const [tab, setTab] = useState<"analyzer" | "acquisition">("analyzer");
+  return (
+    <div
+      style={{
+        background: T.bg,
+        minHeight: "100%",
+        color: T.ink,
+        fontFamily: "'Noto Sans KR', system-ui, sans-serif",
+      }}
+    >
+      <style>{`
+        .fdr{-webkit-appearance:none;appearance:none;width:100%;height:4px;background:var(--border);border-radius:999px;outline:none;cursor:pointer}
+        .fdr::-webkit-slider-thumb{-webkit-appearance:none;width:14px;height:14px;border-radius:50%;background:var(--cyan);box-shadow:0 0 8px var(--glow);border:2px solid var(--card);cursor:pointer}
+        .fdr::-moz-range-thumb{width:14px;height:14px;border-radius:50%;background:var(--cyan);border:2px solid var(--card);cursor:pointer}
+        .seg{display:flex;gap:1px;background:var(--card-2);border:1px solid var(--border);border-radius:6px;padding:2px}
+        .seg button{flex:1;border:0;background:transparent;color:var(--ink-soft);font-size:11px;padding:5px 8px;border-radius:4px;cursor:pointer;letter-spacing:.4px;font-family:'IBM Plex Mono',monospace}
+        .seg button.on{background:var(--card);color:var(--ink)}
+        @media (prefers-reduced-motion: reduce){*{scroll-behavior:auto}}
+      `}</style>
+      <div
+        style={{
+          display: "flex",
+          gap: 2,
+          padding: "10px 14px 0",
+          borderBottom: `1px solid ${T.border}`,
+        }}
+      >
+        {(
+          [
+            ["analyzer", "① ANALYZER"],
+            ["acquisition", "② ACQUISITION"],
+          ] as const
+        ).map(([k, t]) => (
+          <button
+            key={k}
+            onClick={() => setTab(k)}
+            style={{
+              border: 0,
+              borderBottom: `2px solid ${tab === k ? T.cyan : "transparent"}`,
+              background: "transparent",
+              color: tab === k ? T.ink : T.soft,
+              fontSize: 12,
+              letterSpacing: 1,
+              padding: "8px 16px",
+              cursor: "pointer",
+              fontWeight: 600,
+              fontFamily: "'IBM Plex Mono', monospace",
+            }}
+          >
+            {t}
+          </button>
+        ))}
+      </div>
+      {tab === "analyzer" ? <AnalyzerTab /> : <AcquisitionTab />}
+    </div>
+  );
+}

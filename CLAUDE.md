@@ -174,7 +174,7 @@ npm run lint     # ESLint
 ### useTheme 사용
 ```tsx
 'use client';
-import { useTheme } from '@/lib/theme-context';
+import { useTheme } from '@/design-system/theme-context';
 
 export default function MyComponent() {
   const { isDark, toggle } = useTheme();

@@ -3,7 +3,7 @@ import Script from 'next/script';
 import '@/design-system/globals.css';
 import './fx.css';
 import Navbar from '@/design-system/navbar';
-import { ThemeProvider } from '@/lib/theme-context';
+import { ThemeProvider } from '@/design-system/theme-context';
 import Footer from '@/design-system/footer';
 
 const GA_ID = process.env.NEXT_PUBLIC_GA_ID;

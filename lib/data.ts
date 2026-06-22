@@ -10,7 +10,7 @@
  *  ▷ showSlots=false  로 두면 확장 슬롯 섹션이 통째로 숨겨집니다.
  */
 
-export type IconName = 'youtube' | 'stream' | 'x' | 'twitter' | 'discord' | 'support';
+import type { IconName } from '@/design-system/icons';
 
 export interface LinkItem {
   icon: IconName;
